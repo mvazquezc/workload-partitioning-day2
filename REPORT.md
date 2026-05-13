@@ -1,0 +1,318 @@
+# Test Report: Enabling Workload Partitioning Post-Install via Infrastructure CR Patch
+
+**Date:** 2026-05-12
+**OCP Version:** 4.20.21
+
+## Executive Summary
+
+This test validated whether workload partitioning (`cpuPartitioningMode: AllNodes`) can be configured as a day-2 operation on an OpenShift cluster by patching the Infrastructure CR and applying MachineConfigs manually, producing the same runtime behavior as a cluster deployed with day-0 workload partitioning.
+
+**Result:** The two clusters are **functionally identical** (we need to get this procedure validated by the performance team). The day-2 enabled cluster (Cluster B) produces the same node-level configuration, the same management pod CPU confinement, and the same workload pinning behavior as the day-0 cluster (Cluster A).
+
+## Test Environment
+
+| | Cluster A (day-0 WP) | Cluster B (day-2 WP) |
+|---|---|---|
+| **Cluster name** | cluster-a | cluster-b |
+| **API server** | api.cluster-a.example.com:6443 | api.cluster-b.example.com:6443 |
+| **Install-time cpuPartitioningMode** | `AllNodes` | not set (`None`) |
+| **Nodes** | 3 (control-plane+worker) | 3 (control-plane+worker) |
+| **CPUs per node** | 16 (0-15) | 16 (0-15) |
+| **Target node** | cluster-a-ctlplane-0 | cluster-b-ctlplane-0 |
+
+### PerformanceProfile (identical on both)
+
+```yaml
+apiVersion: performance.openshift.io/v2
+kind: PerformanceProfile
+metadata:
+  name: performance-profile
+spec:
+  cpu:
+    isolated: "4-15"
+    reserved: "0-3"
+  nodeSelector:
+    node-role.kubernetes.io/master: ""
+  numa:
+    topologyPolicy: single-numa-node
+  hugepages:
+    defaultHugepagesSize: 1G
+    pages:
+    - count: 2
+      size: 1G
+  additionalKernelArgs:
+  - module_blacklist=irdma
+  realTimeKernel:
+    enabled: false
+  workloadHints:
+    realTime: false
+    highPowerConsumption: false
+    perPodPowerManagement: true
+```
+
+## Pre-State Comparison (Before PerformanceProfile)
+
+Before applying the PerformanceProfile, the two clusters show the expected structural differences from how they were installed.
+
+| Item | Cluster A (day-0 WP) | Cluster B (no WP) |
+|------|----------------------|-------------------|
+| `Infrastructure.status.cpuPartitioning` | `AllNodes` | `None` |
+| `01-*-cpu-partitioning` MCs | Present (from bootstrap) | Absent |
+| `/etc/kubernetes/openshift-workload-pinning` | `{"management":{"cpuset":""}}` | FILE_NOT_FOUND |
+| `/etc/crio/crio.conf.d/01-workload-pinning-default.conf` | Present (empty cpuset) | FILE_NOT_FOUND |
+| CRI-O `management` workload class | Registered (empty cpuset) | Not registered |
+| `management.workload.openshift.io/cores` on nodes | `16k` | `<none>` |
+| API server pod annotations | Has `target.workload.openshift.io/management` and `resources.workload.openshift.io/*` | No workload annotations |
+| API server container `cpus` field | Not shown (no cpuset restriction) | Not shown (no cpuset restriction) |
+| PID 1 CPU affinity | `0-15` (all CPUs) | `0-15` (all CPUs) |
+| CRI-O/kubelet CPU affinity | `0-15` | `0-15` |
+
+Key observation: On Cluster A, the kubelet was in managed mode from boot (file existed), so it registered the extended resource and rewrote static pod CPU requests into `management.workload.openshift.io/cores`. The API server pod already had workload annotations even before any PerformanceProfile existed. On Cluster B, none of this was active.
+
+## Post-State Comparison (After PerformanceProfile)
+
+After following the correct sequence on Cluster B, both clusters were compared with the PerformanceProfile applied and MCO rollout complete.
+
+### TC-01: Infrastructure CR
+
+| | Cluster A | Cluster B |
+|---|---|---|
+| `status.cpuPartitioning` | `AllNodes` | `AllNodes` |
+
+**Result: PASS** -- Identical.
+
+### TC-02: MachineConfig Inventory
+
+Both clusters have the same set of MachineConfigs:
+
+| MC | Cluster A | Cluster B |
+|---|---|---|
+| `01-master-cpu-partitioning` | Present (from bootstrap) | Present (manually applied) |
+| `01-worker-cpu-partitioning` | Present (from bootstrap) | Present (manually applied) |
+| `50-performance-performance-profile` | Present | Present |
+
+The only metadata difference is that Cluster B's MCs have a `kubectl.kubernetes.io/last-applied-configuration` annotation (from `oc apply`), while Cluster A's were created by the bootstrap render process.
+
+**Result: PASS** -- Same MCs present on both.
+
+### TC-03: CRI-O Workload Pinning Config (`99-workload-pinning.conf`)
+
+Cluster A:
+```toml
+[crio.runtime.workloads.management]
+activation_annotation = "target.workload.openshift.io/management"
+annotation_prefix = "resources.workload.openshift.io"
+resources = { "cpushares" = 0, "cpuset" = "0-3" }
+```
+
+Cluster B:
+```toml
+[crio.runtime.workloads.management]
+activation_annotation = "target.workload.openshift.io/management"
+annotation_prefix = "resources.workload.openshift.io"
+resources = { "cpushares" = 0, "cpuset" = "0-3" }
+```
+
+**Result: PASS** -- Identical. Both generated by the NTO controller inside the `50-performance-*` MC.
+
+### TC-04: CRI-O Bootstrap Pinning Config (`01-workload-pinning-default.conf`)
+
+Both clusters have:
+```toml
+[crio.runtime.workloads.management]
+activation_annotation = "target.workload.openshift.io/management"
+annotation_prefix = "resources.workload.openshift.io"
+resources = { "cpushares" = 0, "cpuset" = "" }
+```
+
+**Result: PASS** -- Identical. Overridden by `99-workload-pinning.conf` at runtime.
+
+### TC-05: Kubelet Workload Pinning Config (`/etc/kubernetes/openshift-workload-pinning`)
+
+Cluster A:
+```json
+{"management": {"cpuset": "0-3"}}
+```
+
+Cluster B:
+```json
+{"management": {"cpuset": "0-3"}}
+```
+
+**Result: PASS** -- Identical.
+
+### TC-06: CRI-O Runtime Config (`99-runtimes.conf`)
+
+Both clusters:
+```toml
+[crio.runtime]
+infra_ctr_cpuset = "0-3"
+
+[crio.runtime.runtimes.high-performance]
+inherit_default_runtime = true
+allowed_annotations = ["cpu-load-balancing.crio.io", "cpu-quota.crio.io", "irq-load-balancing.crio.io", "cpu-c-states.crio.io", "cpu-freq-governor.crio.io"]
+```
+
+**Result: PASS** -- Identical.
+
+### TC-07: CRI-O conf.d File Listing
+
+Both clusters have the same files in `/etc/crio/crio.conf.d/`:
+```
+00-default
+01-ctrcfg-defaultUlimits
+01-workload-pinning-default.conf
+99-runtimes.conf
+99-workload-pinning.conf
+```
+
+**Result: PASS** -- Identical.
+
+### TC-08: CRI-O Workload Class Registration
+
+Both clusters show the same effective CRI-O workload configuration:
+```toml
+[crio.runtime.workloads.management]
+activation_annotation = "target.workload.openshift.io/management"
+annotation_prefix = "resources.workload.openshift.io"
+[crio.runtime.workloads.management.resources]
+cpuset = "0-3"
+cpushares = 0
+```
+
+**Result: PASS** -- Identical.
+
+### TC-09: Kernel Command Line
+
+Both clusters (relevant performance parameters):
+```
+nohz=on rcu_nocbs=4-15 tuned.non_isolcpus=0000000f
+systemd.cpu_affinity=0,1,2,3
+isolcpus=managed_irq,4-15
+```
+
+**Result: PASS** -- Identical.
+
+### TC-10: PID 1 (systemd) CPU Affinity
+
+| | Cluster A | Cluster B |
+|---|---|---|
+| PID 1 affinity | `0-3` | `0-3` |
+
+**Result: PASS** -- Identical.
+
+### TC-11: Platform Service CPU Affinity
+
+| Service | Cluster A | Cluster B |
+|---------|-----------|-----------|
+| CRI-O | `0-3` | `0-3` |
+| kubelet | `0-3` | `0-3` |
+
+**Result: PASS** -- Identical.
+
+### TC-12: Management Pod CPU Placement (openshift-apiserver)
+
+Cluster A:
+```json
+{
+  "cpus": "0-3",
+  "period": 100000,
+  "quota": 0,
+  "shares": 10
+}
+```
+
+Cluster B:
+```json
+{
+  "cpus": "0-3",
+  "period": 100000,
+  "quota": 0,
+  "shares": 10
+}
+```
+
+Both pods have the workload annotations:
+- `target.workload.openshift.io/management: {"effect":"PreferredDuringScheduling"}`
+- `resources.workload.openshift.io/openshift-apiserver: {"cpushares":102}`
+- `resources.workload.openshift.io/openshift-apiserver-check-endpoints: {"cpushares":10}`
+- `resources.workload.openshift.io/fix-audit-permissions: {"cpushares":15}`
+
+**Result: PASS** -- Identical. Management pods are confined to reserved CPUs on both clusters.
+
+### TC-13: Node Extended Resources
+
+| | Cluster A | Cluster B |
+|---|---|---|
+| `management.workload.openshift.io/cores` capacity | `16k` | `16k` |
+| `management.workload.openshift.io/cores` allocatable | `16k` | `16k` |
+| All 3 nodes registered | Yes | Yes |
+
+**Result: PASS** -- Identical.
+
+### TC-14: Static Pod Resource Requests
+
+The kubelet rewrites static pod CPU requests from `cpu` to `management.workload.openshift.io/cores` at file read time. On-disk manifests always contain `cpu` requests (written by the operators), but running pods should show `management.workload.openshift.io/cores` after the kubelet's in-memory rewrite.
+
+Static pods created before managed mode was enabled retain the old `cpu` requests and cannot be resized in-place (Kubernetes blocks this for static pods). Two mechanisms are needed to fix this:
+
+1. **Operator-managed static pods** (etcd, kube-apiserver, kube-controller-manager, kube-scheduler): Forcing a new revision via `forceRedeploymentReason` causes the operator's installer pod to delete and rewrite the manifest with a new revision number. The kubelet detects the content change and fully recreates the pod with the managed-mode rewritten spec.
+
+2. **MCO-delivered static pods** (criometricsproxy): These are delivered as ignition files in MachineConfigs, not managed by revisioned operators. They require a manifest move-out/move-back on the node to force the kubelet to delete and recreate them.
+
+After applying both fixes (Steps 5 and 6 in `patch-infra.sh`), all static pods on both clusters use `management.workload.openshift.io/cores`:
+
+| Static Pod | Cluster A | Cluster B | Match? |
+|---|---|---|---|
+| criometricsproxy | `management.workload.openshift.io/cores` (2 containers) | `management.workload.openshift.io/cores` (2 containers) | Yes |
+| etcd-pod | `management.workload.openshift.io/cores` (8 containers) | `management.workload.openshift.io/cores` (8 containers) | Yes |
+| kube-apiserver-pod | `management.workload.openshift.io/cores` (6 containers) | `management.workload.openshift.io/cores` (6 containers) | Yes |
+| kube-controller-manager-pod | `management.workload.openshift.io/cores` (4 containers) | `management.workload.openshift.io/cores` (4 containers) | Yes |
+| kube-scheduler-pod | `management.workload.openshift.io/cores` (4 containers) | `management.workload.openshift.io/cores` (4 containers) | Yes |
+
+No `PodResizePending` conditions on either cluster.
+
+**Result: PASS** -- Identical.
+
+## Results Summary
+
+| Test Case | Description | Result |
+|-----------|-------------|--------|
+| TC-01 | Infrastructure CR cpuPartitioning | PASS |
+| TC-02 | MachineConfig inventory | PASS |
+| TC-03 | CRI-O workload pinning config (99-*) | PASS |
+| TC-04 | CRI-O bootstrap pinning config (01-*) | PASS |
+| TC-05 | Kubelet workload pinning config | PASS |
+| TC-06 | CRI-O runtime config | PASS |
+| TC-07 | CRI-O conf.d file listing | PASS |
+| TC-08 | CRI-O workload class registration | PASS |
+| TC-09 | Kernel command line | PASS |
+| TC-10 | PID 1 CPU affinity | PASS |
+| TC-11 | Platform service CPU affinity | PASS |
+| TC-12 | Management pod CPU placement | PASS |
+| TC-13 | Node extended resources | PASS |
+| TC-14 | Static pod resource requests | PASS |
+
+**All 14 test cases passed.** The two clusters are functionally identical.
+
+## Conclusions
+
+1. **Seems like workload partitioning can be enabled post-install**, producing a configuration identical to a day-0 deployment. The resulting node-level files, CRI-O configs, kubelet configs, kernel parameters, process affinities, management pod CPU placement, and static pod resource accounting are all identical between the two approaches.
+
+2. **Ordering is critical.** The kubelet config file (`/etc/kubernetes/openshift-workload-pinning`) must be delivered and the nodes rebooted before patching the Infrastructure CR. The OpenShift kube-apiserver enforces that nodes report `management.workload.openshift.io/cores` in their status when `cpuPartitioning == AllNodes`. Violating this order causes a deadlock where the `MachineConfigDaemon` cannot update node annotations, blocking MCO rollout.
+
+3. **The correct sequence for retrofitting workload partitioning is:**
+   - Apply `01-master-cpu-partitioning` and `01-worker-cpu-partitioning` MachineConfigs
+   - Wait for MCO rollout (nodes reboot, kubelet registers extended resource)
+   - Verify extended resource on all nodes
+   - Patch `Infrastructure.Status.CPUPartitioning = AllNodes`
+   - Force new static pod revisions sequentially (`forceRedeploymentReason` on etcd, kubeapiserver, kubecontrollermanager, kubescheduler)
+   - Recreate MCO-delivered static pods (move-out/move-back for criometricsproxy and any other non-operator-managed static pods with the `target.workload.openshift.io/management` annotation)
+   - Apply PerformanceProfile
+   - Wait for MCO rollout
+
+4. **Static pods require two different recreation mechanisms.** Operator-managed static pods (etcd, kube-apiserver, etc.) are fixed by forcing new revisions via `forceRedeploymentReason`, which causes the installer pod to delete and rewrite the manifest with a new revision number. MCO-delivered static pods (criometricsproxy) are not managed by revisioned operators and require a manifest move-out/move-back on each node to force kubelet recreation. Both mechanisms are needed because Kubernetes unconditionally blocks in-place resize of static pods.
+
+5. **Extra reboots:** This approach requires one additional node reboot compared to day-0 (the MC delivery reboot before the PerformanceProfile reboot). If the MCs and PerformanceProfile are timed together after the Infrastructure patch, only the PerformanceProfile reboot is needed -- but the MC delivery reboot must happen first to unblock the Infrastructure patch.
+
+6. **Fallback behavior is preserved.** Since the manually-applied `01-*-cpu-partitioning` MCs are structurally identical to the bootstrap-generated ones, deleting the PerformanceProfile on either cluster produces the same fallback: CRI-O and kubelet remain in pinning mode with empty cpusets.

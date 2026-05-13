@@ -1,0 +1,34 @@
+---
+apiVersion: performance.openshift.io/v2
+kind: PerformanceProfile
+metadata:
+  name: performance-profile
+  annotations:
+    # Some pods want the kernel stack to ignore IPv6 router Advertisement.
+    kubeletconfig.experimental: |
+      {"allowedUnsafeSysctls":["net.ipv6.conf.all.accept_ra"]}
+spec:
+  additionalKernelArgs:
+  - module_blacklist=irdma
+  cpu:
+    isolated: "4-15"
+    reserved: "0-3"
+  globallyDisableIrqLoadBalancing: false
+  hugepages:
+    defaultHugepagesSize: 1G
+    pages:
+    - count: 2
+      size: 1G
+  nodeSelector:
+    node-role.kubernetes.io/master: ""
+  workloadHints:
+    realTime: false
+    highPowerConsumption: false
+    perPodPowerManagement: true
+  realTimeKernel:
+    enabled: false
+  numa:
+    # All guaranteed QoS containers get resources from a single NUMA node
+    topologyPolicy: "single-numa-node"
+  net:
+    userLevelNetworking: false

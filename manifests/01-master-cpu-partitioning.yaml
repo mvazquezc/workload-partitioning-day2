@@ -1,0 +1,26 @@
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: master
+  name: 01-master-cpu-partitioning
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+      - contents:
+          # {"management": {"cpuset": ""}}
+          source: data:text/plain;charset=utf-8;base64,CnsKICAibWFuYWdlbWVudCI6IHsKICAgICJjcHVzZXQiOiAiIgogIH0KfQo=
+        mode: 420
+        path: /etc/kubernetes/openshift-workload-pinning
+      - contents:
+          # [crio.runtime.workloads.management]
+          # activation_annotation = "target.workload.openshift.io/management"
+          # annotation_prefix = "resources.workload.openshift.io"
+          # resources = { "cpushares" = 0, "cpuset" = "" }
+          source: data:text/plain;charset=utf-8;base64,CltjcmlvLnJ1bnRpbWUud29ya2xvYWRzLm1hbmFnZW1lbnRdCmFjdGl2YXRpb25fYW5ub3RhdGlvbiA9ICJ0YXJnZXQud29ya2xvYWQub3BlbnNoaWZ0LmlvL21hbmFnZW1lbnQiCmFubm90YXRpb25fcHJlZml4ID0gInJlc291cmNlcy53b3JrbG9hZC5vcGVuc2hpZnQuaW8iCnJlc291cmNlcyA9IHsgImNwdXNoYXJlcyIgPSAwLCAiY3B1c2V0IiA9ICIiIH0K
+        mode: 420
+        path: /etc/crio/crio.conf.d/01-workload-pinning-default.conf
+    systemd: {}
