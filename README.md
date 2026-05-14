@@ -4,14 +4,12 @@
 
 ----
 
-**Non-supported** procedure to enable workload partitioning in OpenShift as a day 2 operation.
+**Non-supported** procedure to enable workload partitioning in OpenShift as a day 2 operation. This **must not** be used in production environments. Keep in mind that the procedure only implements the _happy path_, if things go wrong there is no recovery plan. **Recovery plan is full cluster re-deployment**.
 
 TL;DR: Make sure you're logged as `cluster-admin` in your OCP cluster and run [scripts/patch-infra.sh](scripts/patch-infra.sh).
 
-> **NOTE**: This procedure targets MNO clusters, **do not** run this on SNO clusters.
-
 - **[TEST-PLAN.md](TEST-PLAN.md)** -- Test cases, sequencing, and the critical ordering constraint.
 - **[REPORT.md](REPORT.md)** -- Results and conclusions.
-- **[scripts/](scripts/)** -- Script used for the test.
+- **[scripts/](scripts/)** -- Scripts used for the test.
 - **[manifests/](manifests/)** -- Relevant manifests for the test.
 - **[tools/gomaxprocs-check](tools/gomaxprocs-check/)** -- Utility to check GOMAXPROCS inside a container.
