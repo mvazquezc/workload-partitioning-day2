@@ -302,6 +302,77 @@ echo ""
 echo "    Waiting for pods to stabilize..."
 sleep 15
 
+###############################################################################
+# Step 7: Restart all Deployment/DaemonSet/StatefulSet workloads in WP-labeled
+#          namespaces so they pick up the WP annotations
+###############################################################################
+echo ""
+echo "==> Step 7: Restarting workloads in all WP-labeled namespaces"
+echo "    The kube-apiserver WP admission plugin strips"
+echo "    target.workload.openshift.io/management from pods at admission time"
+echo "    when cpuPartitioning != AllNodes. Pods created before WP was enabled"
+echo "    are missing both WP annotations. Now that cpuPartitioning=AllNodes,"
+echo "    recreating those pods through the webhook preserves the annotation and"
+echo "    triggers resources.workload.openshift.io/* injection."
+echo ""
+echo "    Static pod namespaces are skipped -- already handled by Step 5."
+echo ""
+
+# Static pod namespaces: pods are written by kubelet/installer, not the webhook.
+# forceRedeploymentReason in Step 5 already handled these.
+STATIC_POD_NS="openshift-etcd openshift-kube-apiserver openshift-kube-controller-manager openshift-kube-scheduler"
+
+WP_NAMESPACES=$(oc get namespaces -o json 2>/dev/null | \
+    jq -r '.items[] | select(.metadata.labels["workload.openshift.io/allowed"] == "management") | .metadata.name' | sort)
+
+for ns in $WP_NAMESPACES; do
+    if echo "$STATIC_POD_NS" | grep -qw "$ns"; then
+        echo "    Skipping ${ns} (static pod namespace)."
+        continue
+    fi
+
+    DEPLOYMENTS=$(oc get deployment   -n "$ns" -o name 2>/dev/null || true)
+    DAEMONSETS=$(oc get daemonset     -n "$ns" -o name 2>/dev/null || true)
+    STATEFULSETS=$(oc get statefulset -n "$ns" -o name 2>/dev/null || true)
+
+    if [[ -z "$DEPLOYMENTS$DAEMONSETS$STATEFULSETS" ]]; then
+        echo "    ${ns}: no workloads, skipping."
+        continue
+    fi
+
+    echo "    ${ns}: restarting..."
+    [[ -n "$DEPLOYMENTS"  ]] && oc rollout restart deployment   -n "$ns" 2>/dev/null || true
+    [[ -n "$DAEMONSETS"   ]] && oc rollout restart daemonset    -n "$ns" 2>/dev/null || true
+    [[ -n "$STATEFULSETS" ]] && oc rollout restart statefulset  -n "$ns" 2>/dev/null || true
+
+    for res in $DEPLOYMENTS $DAEMONSETS $STATEFULSETS; do
+        if ! oc rollout status "$res" -n "$ns" --timeout=10m 2>/dev/null; then
+            echo "    WARNING: ${ns}/${res} did not settle within 10m -- check manually."
+        fi
+    done
+    echo "    ${ns}: done."
+done
+
+echo ""
+echo "    Verifying WP annotations on workload-managed pods..."
+MISSING_NAMESPACES=()
+for ns in $WP_NAMESPACES; do
+    BAD=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
+        .items[] |
+        select(.metadata.ownerReferences != null) |
+        select([.metadata.ownerReferences[].kind] | any(. == "ReplicaSet" or . == "DaemonSet" or . == "StatefulSet")) |
+        select(.metadata.annotations["target.workload.openshift.io/management"] == null) |
+        .metadata.name
+    ' 2>/dev/null || true)
+    if [[ -n "$BAD" ]]; then
+        echo "    MISSING in ${ns}: $(echo "$BAD" | tr '\n' ' ')"
+        MISSING_NAMESPACES+=("$ns")
+    fi
+done
+if [[ ${#MISSING_NAMESPACES[@]} -eq 0 ]]; then
+    echo "    OK: All workload-managed pods in WP-labeled namespaces have the target annotation."
+fi
+
 echo ""
 echo "==> Done. The cluster is now in workload partitioning mode."
 echo ""

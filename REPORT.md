@@ -316,3 +316,26 @@ No `PodResizePending` conditions on either cluster.
 5. **Extra reboots:** This approach requires one additional node reboot compared to day-0 (the MC delivery reboot before the PerformanceProfile reboot). If the MCs and PerformanceProfile are timed together after the Infrastructure patch, only the PerformanceProfile reboot is needed -- but the MC delivery reboot must happen first to unblock the Infrastructure patch.
 
 6. **Fallback behavior is preserved.** Since the manually-applied `01-*-cpu-partitioning` MCs are structurally identical to the bootstrap-generated ones, deleting the PerformanceProfile on either cluster produces the same fallback: CRI-O and kubelet remain in pinning mode with empty cpusets.
+
+---
+
+### Workload-Managed Pods: Root Cause and Fix
+
+A must-gather comparison between SNO-1 (day-0) and SNO-2 (day-2) revealed the following:
+
+| | Day-0 SNO | Day-2 SNO (before fix) |
+|---|---|---|
+| WP-labeled namespaces | 62 | 62 (identical) |
+| Permanent pods with full WP annotations | ~90 | 14 |
+| Permanent pods missing both WP annotations | 0 | 77 |
+
+All 77 missing pods span 45 of the 62 WP-labeled namespaces. The only annotated pods in the day-2 cluster are: (a) the 5 static pods, and (b) ~9 Deployment-managed pods that happened to restart after the Infrastructure CR was patched (`metrics-server`, `telemeter-client`, `console`, `controller-manager`, `route-controller-manager`, and a handful of marketplace CatalogSource pods).
+
+#### Root Cause: kube-apiserver WP Admission Plugin
+
+The kube-apiserver contains a workload partitioning admission plugin that processes pods at creation time:
+
+- When `Infrastructure.status.cpuPartitioning == None`: the plugin **strips** `target.workload.openshift.io/management` from the pod spec and does not inject `resources.workload.openshift.io/*`. The pod is admitted without any WP annotations, regardless of what was in the Deployment pod template.
+- When `Infrastructure.status.cpuPartitioning == AllNodes`: the plugin **preserves** `target.workload.openshift.io/management` and **injects** `resources.workload.openshift.io/<container>: {"cpushares":<N>}` for every container based on its CPU requests.
+
+Pods created before the Infrastructure CR was patched to `AllNodes` lost their `target.*` annotation at admission time. They have been running ever since without it. After the patch, only newly created pods go through the webhook with WP active and receive both annotations.
