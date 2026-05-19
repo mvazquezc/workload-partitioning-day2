@@ -309,7 +309,7 @@ sleep 15
 #          namespaces so they pick up the WP annotations
 ###############################################################################
 echo ""
-echo "==> Step 7: Restarting workloads in all WP-labeled namespaces"
+echo "==> Step 7: Recreating pods in all WP-labeled namespaces"
 echo "    The kube-apiserver WP admission plugin strips"
 echo "    target.workload.openshift.io/management from pods at admission time"
 echo "    when cpuPartitioning != AllNodes. Pods created before WP was enabled"
@@ -317,7 +317,10 @@ echo "    are missing both WP annotations. Now that cpuPartitioning=AllNodes,"
 echo "    recreating those pods through the webhook preserves the annotation and"
 echo "    triggers resources.workload.openshift.io/* injection."
 echo ""
-echo "    Static pod namespaces are skipped -- already handled by Step 5."
+echo "    Pods are deleted one by one so their controllers (ReplicaSet,"
+echo "    DaemonSet, StatefulSet) recreate them through the admission webhook."
+echo "    This avoids the oc rollout restart approach, which can be silently"
+echo "    reverted by operator reconciliation before the rollout triggers."
 echo ""
 
 WP_NAMESPACES=$(oc get namespaces -o json 2>/dev/null | \
@@ -325,20 +328,34 @@ WP_NAMESPACES=$(oc get namespaces -o json 2>/dev/null | \
 
 for ns in $WP_NAMESPACES; do
 
-    DEPLOYMENTS=$(oc get deployment   -n "$ns" -o name 2>/dev/null || true)
-    DAEMONSETS=$(oc get daemonset     -n "$ns" -o name 2>/dev/null || true)
-    STATEFULSETS=$(oc get statefulset -n "$ns" -o name 2>/dev/null || true)
+    # Get pods owned by controllers (ReplicaSet/DaemonSet/StatefulSet)
+    PODS=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
+        .items[] |
+        select(.metadata.ownerReferences != null) |
+        select([.metadata.ownerReferences[].kind] | any(. == "ReplicaSet" or . == "DaemonSet" or . == "StatefulSet")) |
+        .metadata.name
+    ' 2>/dev/null || true)
 
-    if [[ -z "$DEPLOYMENTS$DAEMONSETS$STATEFULSETS" ]]; then
-        echo "    ${ns}: no workloads, skipping."
+    if [[ -z "$PODS" ]]; then
+        echo "    ${ns}: no controller-managed pods found, skipping."
         continue
     fi
 
-    echo "    ${ns}: restarting..."
-    [[ -n "$DEPLOYMENTS"  ]] && oc rollout restart deployment   -n "$ns" 2>/dev/null || true
-    [[ -n "$DAEMONSETS"   ]] && oc rollout restart daemonset    -n "$ns" 2>/dev/null || true
-    [[ -n "$STATEFULSETS" ]] && oc rollout restart statefulset  -n "$ns" 2>/dev/null || true
+    POD_COUNT=$(echo "$PODS" | wc -l)
+    echo "    ${ns}: deleting ${POD_COUNT} pod(s) one by one..."
+    for pod in $PODS; do
+        echo "      deleting pod/${pod}..."
+        oc delete pod "$pod" -n "$ns" 2>/dev/null || {
+            echo "      WARNING: failed to delete pod/${pod}."
+        }
+        sleep 3
+    done
 
+    # Wait for all workloads to reach full availability
+    echo "    ${ns}: waiting for workloads to stabilize..."
+    DEPLOYMENTS=$(oc get deployment   -n "$ns" -o name 2>/dev/null || true)
+    DAEMONSETS=$(oc get daemonset     -n "$ns" -o name 2>/dev/null || true)
+    STATEFULSETS=$(oc get statefulset -n "$ns" -o name 2>/dev/null || true)
     for res in $DEPLOYMENTS $DAEMONSETS $STATEFULSETS; do
         if ! oc rollout status "$res" -n "$ns" --timeout=10m 2>/dev/null; then
             echo "    WARNING: ${ns}/${res} did not settle within 10m -- check manually."
