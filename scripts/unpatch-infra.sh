@@ -215,14 +215,16 @@ for node in $NODES; do
     fi
 
     echo "    ${node}: recreating: ${STALE_MANIFESTS}"
+    # Collapse newlines to spaces so the list is valid inside a for-loop in bash -c
+    STALE_MANIFESTS_FLAT=$(echo "$STALE_MANIFESTS" | tr '\n' ' ')
     oc debug "node/${node}" --quiet -- chroot /host bash -c "
-        for f in ${STALE_MANIFESTS}; do
+        for f in ${STALE_MANIFESTS_FLAT}; do
             [ -f \"\$f\" ] || continue
             tmp=\"/etc/kubernetes/\$(basename \"\$f\").tmp\"
             mv \"\$f\" \"\$tmp\"
         done
         sleep 10
-        for f in ${STALE_MANIFESTS}; do
+        for f in ${STALE_MANIFESTS_FLAT}; do
             [ -f \"\$f\" ] && continue
             tmp=\"/etc/kubernetes/\$(basename \"\$f\").tmp\"
             [ -f \"\$tmp\" ] && mv \"\$tmp\" \"\$f\"
