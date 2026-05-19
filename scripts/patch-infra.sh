@@ -320,18 +320,10 @@ echo ""
 echo "    Static pod namespaces are skipped -- already handled by Step 5."
 echo ""
 
-# Static pod namespaces: pods are written by kubelet/installer, not the webhook.
-# forceRedeploymentReason in Step 5 already handled these.
-STATIC_POD_NS="openshift-etcd openshift-kube-apiserver openshift-kube-controller-manager openshift-kube-scheduler"
-
 WP_NAMESPACES=$(oc get namespaces -o json 2>/dev/null | \
-    jq -r '.items[] | select(.metadata.labels["workload.openshift.io/allowed"] == "management") | .metadata.name' | sort)
+    jq -r '.items[] | select(.metadata.annotations["workload.openshift.io/allowed"] == "management") | .metadata.name' | sort)
 
 for ns in $WP_NAMESPACES; do
-    if echo "$STATIC_POD_NS" | grep -qw "$ns"; then
-        echo "    Skipping ${ns} (static pod namespace)."
-        continue
-    fi
 
     DEPLOYMENTS=$(oc get deployment   -n "$ns" -o name 2>/dev/null || true)
     DAEMONSETS=$(oc get daemonset     -n "$ns" -o name 2>/dev/null || true)
