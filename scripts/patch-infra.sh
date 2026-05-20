@@ -330,21 +330,25 @@ WP_NAMESPACES=$(oc get namespaces -o json 2>/dev/null | \
 
 for ns in $WP_NAMESPACES; do
 
-    # Get pods owned by controllers (ReplicaSet/DaemonSet/StatefulSet)
+    # Get pods owned by controllers (ReplicaSet/DaemonSet/StatefulSet) that are
+    # still missing WP resources annotations (not yet properly admitted).
+    # The admission webhook keys annotations by container name, e.g.
+    # resources.workload.openshift.io/<container>, so we check whether ANY
+    # annotation with that prefix exists rather than a fixed key.
     PODS=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
         .items[] |
         select(.metadata.ownerReferences != null) |
         select([.metadata.ownerReferences[].kind] | any(. == "ReplicaSet" or . == "DaemonSet" or . == "StatefulSet")) |
+        select([(.metadata.annotations // {}) | keys[] | select(startswith("resources.workload.openshift.io/"))] | length == 0) |
         .metadata.name
     ' 2>/dev/null || true)
 
     if [[ -z "$PODS" ]]; then
-        echo "    ${ns}: no controller-managed pods found, skipping."
         continue
     fi
 
     POD_COUNT=$(echo "$PODS" | wc -l)
-    echo "    ${ns}: deleting ${POD_COUNT} pod(s) one by one..."
+    echo "    ${ns}: deleting ${POD_COUNT} pod(s) missing WP resource annotations..."
     for pod in $PODS; do
         echo "      deleting pod/${pod}..."
         oc delete pod "$pod" -n "$ns" 2>/dev/null || {
@@ -375,13 +379,13 @@ echo "    server admission webhook, which now injects WP resource annotations."
 echo ""
 
 for ns in $WP_NAMESPACES; do
-    # Find bare pods that have the WP target annotation but are missing the
-    # resources annotation (i.e., they were created before WP was enabled)
+    # Find bare pods that have the WP target annotation but are missing any
+    # resources.workload.openshift.io/* annotation (created before WP was enabled)
     BARE_PODS=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
         .items[] |
         select(.metadata.ownerReferences == null or (.metadata.ownerReferences | length) == 0) |
         select(.metadata.annotations["target.workload.openshift.io/management"] != null) |
-        select(.metadata.annotations["resources.workload.openshift.io/management"] == null) |
+        select([(.metadata.annotations // {}) | keys[] | select(startswith("resources.workload.openshift.io/"))] | length == 0) |
         .metadata.name
     ' 2>/dev/null || true)
 
@@ -418,12 +422,12 @@ for ns in $WP_NAMESPACES; do
     ' 2>/dev/null || true)
 
     # Check bare pods that have the target annotation but are still missing
-    # the resources annotation after recreation
+    # any resources.workload.openshift.io/* annotation after recreation
     BAD_BARE=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
         .items[] |
         select(.metadata.ownerReferences == null or (.metadata.ownerReferences | length) == 0) |
         select(.metadata.annotations["target.workload.openshift.io/management"] != null) |
-        select(.metadata.annotations["resources.workload.openshift.io/management"] == null) |
+        select([(.metadata.annotations // {}) | keys[] | select(startswith("resources.workload.openshift.io/"))] | length == 0) |
         .metadata.name
     ' 2>/dev/null || true)
 
