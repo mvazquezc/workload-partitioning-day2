@@ -303,11 +303,46 @@ for ns in $WP_NAMESPACES; do
 done
 
 echo ""
+echo "    Recreating pods managed by non-standard controllers (CatalogSource, etc.)..."
+echo "    Some pods are owned by controllers other than ReplicaSet/DaemonSet/"
+echo "    StatefulSet and are not handled by the loop above. Deleting them causes"
+echo "    their controller to recreate them without WP resource annotations."
+echo ""
+
+for ns in $WP_NAMESPACES; do
+    # Find running pods with ownerReferences that are NOT RS/DS/SS and still
+    # carry WP resource annotations. Succeeded/Failed pods (e.g., installer,
+    # revision-pruner) are excluded -- they are ephemeral and deleting them
+    # serves no purpose.
+    OTHER_PODS=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
+        .items[] |
+        select(.status.phase != "Succeeded" and .status.phase != "Failed") |
+        select(.metadata.ownerReferences != null and (.metadata.ownerReferences | length) > 0) |
+        select([.metadata.ownerReferences[].kind] | any(. == "ReplicaSet" or . == "DaemonSet" or . == "StatefulSet") | not) |
+        select([(.metadata.annotations // {}) | keys[] | select(startswith("resources.workload.openshift.io/"))] | length > 0) |
+        .metadata.name
+    ' 2>/dev/null || true)
+
+    if [[ -z "$OTHER_PODS" ]]; then
+        continue
+    fi
+
+    OTHER_COUNT=$(echo "$OTHER_PODS" | wc -l)
+    echo "    ${ns}: deleting ${OTHER_COUNT} non-standard controller pod(s) still carrying WP resource annotations..."
+    for pod in $OTHER_PODS; do
+        echo "      deleting pod/${pod}..."
+        oc delete pod "$pod" -n "$ns" 2>/dev/null || {
+            echo "      WARNING: failed to delete pod/${pod}."
+        }
+        sleep 3
+    done
+done
+
+echo ""
 echo "    Recreating bare pods (no ownerReferences) that still carry WP resource annotations..."
 echo "    Some pods (e.g., guard pods) are created directly by operators without a"
-echo "    controller ownerReference. These are skipped by the controller-managed loop"
-echo "    above. Deleting them causes the operator to recreate them through the API"
-echo "    server, which now strips the WP resource annotations since cpuPartitioning=None."
+echo "    controller ownerReference. Deleting them causes the operator to recreate"
+echo "    them without WP resource annotations."
 echo ""
 
 for ns in $WP_NAMESPACES; do
@@ -336,36 +371,23 @@ for ns in $WP_NAMESPACES; do
 done
 
 echo ""
-echo "    Waiting for operator controllers to recreate bare pods..."
+echo "    Waiting for operator controllers to recreate pods..."
 sleep 15
 
 echo ""
 echo "    Verifying WP annotations stripped from all pods..."
 STILL_ANNOTATED=()
 for ns in $WP_NAMESPACES; do
-    # Check controller-managed pods that still have the target annotation
-    ANNOTATED_CONTROLLER=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
+    # Find any pod (regardless of owner) that still carries WP resource annotations
+    BAD_PODS=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
         .items[] |
-        select(.metadata.ownerReferences != null) |
-        select([.metadata.ownerReferences[].kind] | any(. == "ReplicaSet" or . == "DaemonSet" or . == "StatefulSet")) |
-        select(.metadata.annotations["target.workload.openshift.io/management"] != null) |
-        .metadata.name
-    ' 2>/dev/null || true)
-
-    # Check bare pods that still have any resources.workload.openshift.io/* annotation
-    ANNOTATED_BARE=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
-        .items[] |
-        select(.metadata.ownerReferences == null or (.metadata.ownerReferences | length) == 0) |
+        select(.status.phase != "Succeeded" and .status.phase != "Failed") |
         select([(.metadata.annotations // {}) | keys[] | select(startswith("resources.workload.openshift.io/"))] | length > 0) |
         .metadata.name
     ' 2>/dev/null || true)
 
-    if [[ -n "$ANNOTATED_CONTROLLER" ]]; then
-        echo "    STILL ANNOTATED in ${ns}: $(echo "$ANNOTATED_CONTROLLER" | tr '\n' ' ')"
-        STILL_ANNOTATED+=("$ns")
-    fi
-    if [[ -n "$ANNOTATED_BARE" ]]; then
-        echo "    STILL ANNOTATED (bare pods) in ${ns}: $(echo "$ANNOTATED_BARE" | tr '\n' ' ')"
+    if [[ -n "$BAD_PODS" ]]; then
+        echo "    STILL ANNOTATED in ${ns}: $(echo "$BAD_PODS" | tr '\n' ' ')"
         STILL_ANNOTATED+=("$ns")
     fi
 done
