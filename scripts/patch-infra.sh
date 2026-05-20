@@ -305,8 +305,8 @@ echo "    Waiting for pods to stabilize..."
 sleep 15
 
 ###############################################################################
-# Step 7: Restart all Deployment/DaemonSet/StatefulSet workloads in WP-labeled
-#          namespaces so they pick up the WP annotations
+# Step 7: Restart all Deployment/DaemonSet/StatefulSet workloads and bare pods
+#          in WP-labeled namespaces so they pick up the WP annotations
 ###############################################################################
 echo ""
 echo "==> Step 7: Recreating pods in all WP-labeled namespaces"
@@ -317,10 +317,12 @@ echo "    are missing both WP annotations. Now that cpuPartitioning=AllNodes,"
 echo "    recreating those pods through the webhook preserves the annotation and"
 echo "    triggers resources.workload.openshift.io/* injection."
 echo ""
-echo "    Pods are deleted one by one so their controllers (ReplicaSet,"
-echo "    DaemonSet, StatefulSet) recreate them through the admission webhook."
-echo "    This avoids the oc rollout restart approach, which can be silently"
-echo "    reverted by operator reconciliation before the rollout triggers."
+echo "    Controller-managed pods are deleted one by one so their controllers"
+echo "    (ReplicaSet, DaemonSet, StatefulSet) recreate them through the"
+echo "    admission webhook. Bare pods without ownerReferences (e.g., guard"
+echo "    pods created directly by operators) are also deleted so their"
+echo "    operator controllers detect the absence and recreate them through"
+echo "    the API server."
 echo ""
 
 WP_NAMESPACES=$(oc get namespaces -o json 2>/dev/null | \
@@ -365,23 +367,77 @@ for ns in $WP_NAMESPACES; do
 done
 
 echo ""
-echo "    Verifying WP annotations on workload-managed pods..."
+echo "    Recreating bare pods (no ownerReferences) missing WP resource annotations..."
+echo "    Some pods (e.g., guard pods) are created directly by operators without a"
+echo "    controller ownerReference. These are skipped by the controller-managed loop"
+echo "    above. Deleting them causes the operator to recreate them through the API"
+echo "    server admission webhook, which now injects WP resource annotations."
+echo ""
+
+for ns in $WP_NAMESPACES; do
+    # Find bare pods that have the WP target annotation but are missing the
+    # resources annotation (i.e., they were created before WP was enabled)
+    BARE_PODS=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
+        .items[] |
+        select(.metadata.ownerReferences == null or (.metadata.ownerReferences | length) == 0) |
+        select(.metadata.annotations["target.workload.openshift.io/management"] != null) |
+        select(.metadata.annotations["resources.workload.openshift.io/management"] == null) |
+        .metadata.name
+    ' 2>/dev/null || true)
+
+    if [[ -z "$BARE_PODS" ]]; then
+        continue
+    fi
+
+    BARE_COUNT=$(echo "$BARE_PODS" | wc -l)
+    echo "    ${ns}: deleting ${BARE_COUNT} bare pod(s) missing WP resource annotations..."
+    for pod in $BARE_PODS; do
+        echo "      deleting pod/${pod}..."
+        oc delete pod "$pod" -n "$ns" 2>/dev/null || {
+            echo "      WARNING: failed to delete pod/${pod}."
+        }
+        sleep 3
+    done
+done
+
+echo ""
+echo "    Waiting for operator controllers to recreate bare pods..."
+sleep 15
+
+echo ""
+echo "    Verifying WP annotations on all pods..."
 MISSING_NAMESPACES=()
 for ns in $WP_NAMESPACES; do
-    BAD=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
+    # Check controller-managed pods missing the target annotation
+    BAD_CONTROLLER=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
         .items[] |
         select(.metadata.ownerReferences != null) |
         select([.metadata.ownerReferences[].kind] | any(. == "ReplicaSet" or . == "DaemonSet" or . == "StatefulSet")) |
         select(.metadata.annotations["target.workload.openshift.io/management"] == null) |
         .metadata.name
     ' 2>/dev/null || true)
-    if [[ -n "$BAD" ]]; then
-        echo "    MISSING in ${ns}: $(echo "$BAD" | tr '\n' ' ')"
+
+    # Check bare pods that have the target annotation but are still missing
+    # the resources annotation after recreation
+    BAD_BARE=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r '
+        .items[] |
+        select(.metadata.ownerReferences == null or (.metadata.ownerReferences | length) == 0) |
+        select(.metadata.annotations["target.workload.openshift.io/management"] != null) |
+        select(.metadata.annotations["resources.workload.openshift.io/management"] == null) |
+        .metadata.name
+    ' 2>/dev/null || true)
+
+    if [[ -n "$BAD_CONTROLLER" ]]; then
+        echo "    MISSING target annotation in ${ns}: $(echo "$BAD_CONTROLLER" | tr '\n' ' ')"
+        MISSING_NAMESPACES+=("$ns")
+    fi
+    if [[ -n "$BAD_BARE" ]]; then
+        echo "    MISSING resources annotation (bare pods) in ${ns}: $(echo "$BAD_BARE" | tr '\n' ' ')"
         MISSING_NAMESPACES+=("$ns")
     fi
 done
 if [[ ${#MISSING_NAMESPACES[@]} -eq 0 ]]; then
-    echo "    OK: All workload-managed pods in WP-labeled namespaces have the target annotation."
+    echo "    OK: All pods in WP-labeled namespaces have the expected WP annotations."
 fi
 
 echo ""
