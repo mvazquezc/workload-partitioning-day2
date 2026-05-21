@@ -16,9 +16,11 @@
 #                  constrained to reserved/housekeeping CPUs.
 #
 # Color coding:
-#   Red      management namespace but pod is missing MGMT SCHED or WKLD ANNOTS
-#   Yellow   pod has MGMT SCHED but CORES REQ is not "yes" (potentially
-#            dangerous -- not pinned to housekeeping CPUs)
+#   Red      management namespace but pod is missing MGMT SCHED or WKLD ANNOTS,
+#            OR pod has both MGMT SCHED and WKLD ANNOTS but CORES REQ is "no"
+#            (still uses cpu instead of management cores -- something went wrong)
+#   Yellow   pod has MGMT SCHED and WKLD ANNOTS but CORES REQ is "no-cpu"
+#            (BestEffort pod -- not pinned to housekeeping CPUs)
 #
 # Namespaces with no pods are omitted.
 #
@@ -95,9 +97,18 @@ while IFS= read -r ns; do
         color=""
         if [[ "$is_mgmt" == "yes" && \
               ("$mgmt_sched" == "no" || "$wkld_annots" == "no") ]]; then
+            # Missing expected annotations in management namespace
             color="$RED"
             ISSUES=$(( ISSUES + 1 ))
-        elif [[ "$mgmt_sched" == "yes" && "$cores_req" != "yes" ]]; then
+        elif [[ "$mgmt_sched" == "yes" && "$wkld_annots" == "yes" && \
+                "$cores_req" == "no" ]]; then
+            # Has WP annotations but still uses cpu instead of
+            # management.workload.openshift.io/cores -- something went wrong
+            color="$RED"
+            ISSUES=$(( ISSUES + 1 ))
+        elif [[ "$mgmt_sched" == "yes" && "$wkld_annots" == "yes" && \
+                "$cores_req" == "no-cpu" ]]; then
+            # BestEffort pod -- no CPU request, not pinned to housekeeping CPUs
             color="$YELLOW"
             WARNINGS=$(( WARNINGS + 1 ))
         fi
