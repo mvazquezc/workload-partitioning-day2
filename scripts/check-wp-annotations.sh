@@ -17,8 +17,8 @@
 #
 # Color coding:
 #   Red      management namespace but pod is missing MGMT SCHED or WKLD ANNOTS
-#   Yellow   management namespace, annotations OK, but pod has no CPU request
-#            (potentially dangerous -- not pinned to housekeeping CPUs)
+#   Yellow   pod has MGMT SCHED but CORES REQ is not "yes" (potentially
+#            dangerous -- not pinned to housekeeping CPUs)
 #
 # Namespaces with no pods are omitted.
 #
@@ -97,7 +97,7 @@ while IFS= read -r ns; do
               ("$mgmt_sched" == "no" || "$wkld_annots" == "no") ]]; then
             color="$RED"
             ISSUES=$(( ISSUES + 1 ))
-        elif [[ "$is_mgmt" == "yes" && "$cores_req" == "no-cpu" ]]; then
+        elif [[ "$mgmt_sched" == "yes" && "$cores_req" != "yes" ]]; then
             color="$YELLOW"
             WARNINGS=$(( WARNINGS + 1 ))
         fi
