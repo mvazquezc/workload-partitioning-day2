@@ -11,15 +11,20 @@
 #   MGMT SCHED     pod carries target.workload.openshift.io/management annotation
 #   WKLD ANNOTS    pod carries at least one resources.workload.openshift.io/* annotation
 #   CORES REQ      every container requests management.workload.openshift.io/cores and no cpu
+#                  "no-cpu" means no cpu-related request at all (neither cpu nor
+#                  management.workload.openshift.io/cores); the pod will NOT be
+#                  constrained to reserved/housekeeping CPUs.
 #
-# Lines are printed in red when the namespace IS management but the pod is
-# missing MGMT SCHED or WKLD ANNOTS.
+# Color coding:
+#   Red      management namespace but pod is missing MGMT SCHED or WKLD ANNOTS
+#   Yellow   management namespace, annotations OK, but pod has no CPU request
+#            (potentially dangerous -- not pinned to housekeeping CPUs)
 #
 # Namespaces with no pods are omitted.
 #
 # Exit codes:
 #   0  No issues found
-#   1  One or more red lines
+#   1  One or more red or yellow lines
 
 set -euo pipefail
 
@@ -29,6 +34,7 @@ if ! oc whoami &>/dev/null; then
 fi
 
 RED=$'\033[0;31m'
+YELLOW=$'\033[0;33m'
 NC=$'\033[0m'
 
 # Column widths
@@ -59,6 +65,7 @@ print_row "NAMESPACE" "IS MGMT" "POD" "MGMT SCHED" "WKLD ANNOTS" "CORES REQ" ""
 echo "$SEP"
 
 ISSUES=0
+WARNINGS=0
 TOTAL_PODS=0
 
 # Use $'\x1f' (ASCII unit separator) as the field delimiter inside jq output
@@ -90,6 +97,9 @@ while IFS= read -r ns; do
               ("$mgmt_sched" == "no" || "$wkld_annots" == "no") ]]; then
             color="$RED"
             ISSUES=$(( ISSUES + 1 ))
+        elif [[ "$is_mgmt" == "yes" && "$cores_req" == "no-cpu" ]]; then
+            color="$YELLOW"
+            WARNINGS=$(( WARNINGS + 1 ))
         fi
 
         print_row "$ns" "$is_mgmt" "$pod_name" \
@@ -111,14 +121,22 @@ while IFS= read -r ns; do
              then "yes" else "no" end),
 
             # CORES REQ: every container requests management.workload.openshift.io/cores
-            #            and does NOT request cpu
+            #            and does NOT request cpu.
+            # "yes"    = all containers use management.workload.openshift.io/cores (properly pinned)
+            # "no"     = at least one container still uses cpu (needs WP fix)
+            # "no-cpu" = at least one container has neither cpu nor
+            #            management.workload.openshift.io/cores (not pinned to
+            #            housekeeping CPUs -- potentially dangerous)
             (if (.spec.containers | length) == 0 then "no"
              else
-               [ .spec.containers[] |
+               ([ .spec.containers[] |
                  (.resources.requests // {}) |
-                 ( has("management.workload.openshift.io/cores") and
-                   (has("cpu") | not) )
-               ] | all | if . then "yes" else "no" end
+                 { wp: has("management.workload.openshift.io/cores"),
+                   cpu: has("cpu") }
+               ]) | if all(.wp) then "yes"
+                    elif any(.cpu) then "no"
+                    else "no-cpu"
+                    end
              end)
 
         ] | join($fs)')
@@ -126,11 +144,18 @@ while IFS= read -r ns; do
 done < <(oc get ns -o name </dev/null 2>/dev/null | sed 's|^namespace/||' | sort)
 
 echo "$SEP"
-if [[ $ISSUES -eq 0 ]]; then
+SUMMARY=""
+if [[ $ISSUES -gt 0 ]]; then
+    SUMMARY="${RED}${ISSUES} pods in management namespaces missing expected annotations${NC}"
+fi
+if [[ $WARNINGS -gt 0 ]]; then
+    [[ -n "$SUMMARY" ]] && SUMMARY="${SUMMARY}  ·  "
+    SUMMARY="${SUMMARY}${YELLOW}${WARNINGS} pods without CPU requests (potentially dangerous)${NC}"
+fi
+if [[ -z "$SUMMARY" ]]; then
     printf "  %d pods checked  ·  no issues\n\n" "$TOTAL_PODS"
 else
-    printf "  %d pods checked  ·  %s%d pods in management namespaces missing expected annotations%s\n\n" \
-        "$TOTAL_PODS" "$RED" "$ISSUES" "$NC"
+    printf "  %d pods checked  ·  %b\n\n" "$TOTAL_PODS" "$SUMMARY"
 fi
 
-[[ $ISSUES -eq 0 ]] && exit 0 || exit 1
+[[ $ISSUES -eq 0 && $WARNINGS -eq 0 ]] && exit 0 || exit 1
