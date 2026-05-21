@@ -16,10 +16,11 @@
 #                  constrained to reserved/housekeeping CPUs.
 #
 # Color coding:
-#   Red      management namespace but pod is missing MGMT SCHED or WKLD ANNOTS,
-#            OR pod has both MGMT SCHED and WKLD ANNOTS but CORES REQ is "no"
-#            (still uses cpu instead of management cores -- something went wrong)
-#   Yellow   pod has MGMT SCHED and WKLD ANNOTS but CORES REQ is "no-cpu"
+#   Red      management namespace but pod has no MGMT SCHED at all, OR pod has
+#            both MGMT SCHED and WKLD ANNOTS but CORES REQ is "no" (still uses
+#            cpu instead of management cores -- something went wrong)
+#   Yellow   pod has MGMT SCHED but is missing WKLD ANNOTS (needs recreation),
+#            OR pod has MGMT SCHED and WKLD ANNOTS but CORES REQ is "no-cpu"
 #            (BestEffort pod -- not pinned to housekeeping CPUs)
 #
 # Namespaces with no pods are omitted.
@@ -95,9 +96,8 @@ while IFS= read -r ns; do
         TOTAL_PODS=$(( TOTAL_PODS + 1 ))
 
         color=""
-        if [[ "$is_mgmt" == "yes" && \
-              ("$mgmt_sched" == "no" || "$wkld_annots" == "no") ]]; then
-            # Missing expected annotations in management namespace
+        if [[ "$is_mgmt" == "yes" && "$mgmt_sched" == "no" ]]; then
+            # Pod in management namespace completely missing WP target annotation
             color="$RED"
             ISSUES=$(( ISSUES + 1 ))
         elif [[ "$mgmt_sched" == "yes" && "$wkld_annots" == "yes" && \
@@ -106,6 +106,11 @@ while IFS= read -r ns; do
             # management.workload.openshift.io/cores -- something went wrong
             color="$RED"
             ISSUES=$(( ISSUES + 1 ))
+        elif [[ "$mgmt_sched" == "yes" && "$wkld_annots" == "no" ]]; then
+            # Has target annotation but missing resources annotation --
+            # pod needs to be recreated through the admission webhook
+            color="$YELLOW"
+            WARNINGS=$(( WARNINGS + 1 ))
         elif [[ "$mgmt_sched" == "yes" && "$wkld_annots" == "yes" && \
                 "$cores_req" == "no-cpu" ]]; then
             # BestEffort pod -- no CPU request, not pinned to housekeeping CPUs
